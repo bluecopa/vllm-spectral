@@ -639,6 +639,11 @@ def unified_kv_cache_update(
     """
     # SpectralQuant: rotate K/V into spectral basis before caching
     if spectral_cache.is_enabled():
+        _sc_debug = getattr(unified_kv_cache_update, '_debug_count', 0)
+        if _sc_debug < 3:
+            logger.info("SpectralQuant KV rotate: layer=%s key=%s value=%s",
+                        layer_name, key.shape, value.shape)
+        unified_kv_cache_update._debug_count = _sc_debug + 1
         key, value = spectral_cache.rotate_kv(key, value, layer_name)
 
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
@@ -692,6 +697,11 @@ def unified_attention_with_output(
 
     # SpectralQuant: rotate Q to match cached rotated K
     if spectral_cache.is_enabled():
+        _sc_debug2 = getattr(unified_attention_with_output, '_debug_count', 0)
+        if _sc_debug2 < 3:
+            logger.info("SpectralQuant Q rotate: layer=%s query=%s",
+                        layer_name, query.shape)
+        unified_attention_with_output._debug_count = _sc_debug2 + 1
         query = spectral_cache.rotate_q(query, layer_name)
 
     self.impl.forward(
