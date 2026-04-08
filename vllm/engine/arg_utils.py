@@ -633,6 +633,7 @@ class EngineArgs:
     kv_offloading_size: float | None = CacheConfig.kv_offloading_size
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
     spectral_calibration: str | None = CacheConfig.spectral_calibration
+    spectral_rank: int | None = CacheConfig.spectral_rank
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1056,6 +1057,9 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--spectral-calibration", **cache_kwargs["spectral_calibration"]
+        )
+        cache_group.add_argument(
+            "--spectral-rank", **cache_kwargs["spectral_rank"]
         )
 
         # Model weight offload related configs
@@ -1624,6 +1628,7 @@ class EngineArgs:
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
             spectral_calibration=self.spectral_calibration,
+            spectral_rank=self.spectral_rank,
         )
 
         ray_runtime_env = None

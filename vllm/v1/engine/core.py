@@ -119,7 +119,9 @@ class EngineCore:
         if vllm_config.cache_config.spectral_calibration:
             from vllm.v1.attention import spectral as spectral_cache
             spectral_cache.init_spectral(
-                vllm_config.cache_config.spectral_calibration)
+                vllm_config.cache_config.spectral_calibration,
+                spectral_rank=vllm_config.cache_config.spectral_rank,
+            )
 
         self.available_gpu_memory_for_kv_cache = -1
 

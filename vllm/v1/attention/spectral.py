@@ -41,6 +41,9 @@ _SPECTRAL_REGISTRY: dict[str, "SpectralCalibration"] = {}
 # Global flag for whether spectral rotation is enabled
 _SPECTRAL_ENABLED = False
 
+# Spectral rank for Phase 2 truncation (None = Phase 1 rotation only)
+_SPECTRAL_RANK: int | None = None
+
 
 @dataclass
 class LayerSpectralConfig:
@@ -118,21 +121,40 @@ def _extract_layer_index(layer_name: str) -> int:
     raise ValueError(f"Cannot extract layer index from: {layer_name}")
 
 
-def init_spectral(sidecar_path: str, device: str = "cuda") -> None:
+def init_spectral(
+    sidecar_path: str,
+    spectral_rank: int | None = None,
+    device: str = "cuda",
+) -> None:
     """Initialize spectral calibration from sidecar file.
 
     Called during vLLM model loading when --spectral-calibration is set.
+
+    Args:
+        sidecar_path: Path to calibration .pt file.
+        spectral_rank: If set, truncate cache to this many dims per head
+            (Phase 2). If None, rotation only (Phase 1).
+        device: Device to load rotation matrices onto.
     """
-    global _SPECTRAL_ENABLED
+    global _SPECTRAL_ENABLED, _SPECTRAL_RANK
     if sidecar_path in _SPECTRAL_REGISTRY:
         logger.info("SpectralQuant already loaded for %s", sidecar_path)
         _SPECTRAL_ENABLED = True
+        _SPECTRAL_RANK = spectral_rank
         return
 
     calibration = SpectralCalibration(sidecar_path, device=device)
     _SPECTRAL_REGISTRY[sidecar_path] = calibration
     _SPECTRAL_ENABLED = True
-    logger.info("SpectralQuant enabled")
+    _SPECTRAL_RANK = spectral_rank
+
+    if spectral_rank is not None:
+        logger.info(
+            "SpectralQuant Phase 2 enabled: truncating cache to %d dims/head",
+            spectral_rank,
+        )
+    else:
+        logger.info("SpectralQuant Phase 1 enabled: rotation only")
 
 
 def get_calibration() -> SpectralCalibration | None:
@@ -147,6 +169,27 @@ def is_enabled() -> bool:
     return _SPECTRAL_ENABLED
 
 
+def is_truncating() -> bool:
+    """Check if Phase 2 truncation is active."""
+    return _SPECTRAL_ENABLED and _SPECTRAL_RANK is not None
+
+
+def get_spectral_rank() -> int | None:
+    """Get the configured spectral rank (None if Phase 1 only)."""
+    return _SPECTRAL_RANK
+
+
+def get_spectral_head_size(layer_name: str) -> int | None:
+    """Get the truncated head_size for cache allocation.
+
+    Returns spectral_rank if truncation is enabled, None otherwise.
+    Used by Attention.get_kv_cache_spec() to allocate smaller cache blocks.
+    """
+    if not is_truncating():
+        return None
+    return _SPECTRAL_RANK
+
+
 def rotate_kv(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -155,16 +198,17 @@ def rotate_kv(
     """
     Rotate K and V tensors into spectral basis before cache storage.
 
+    If Phase 2 (truncation) is active, only the first spectral_rank
+    columns of the rotation matrix are used, producing truncated output.
+
     Args:
         key: (num_tokens, num_kv_heads, head_dim)
         value: (num_tokens, num_kv_heads, head_dim)
         layer_name: vLLM layer identifier
 
     Returns:
-        (rotated_key, rotated_value) with same shapes
-
-    Math: k_rotated = k @ V_k  (row-vector convention)
-    This is equivalent to V_k^T @ k_col for column vectors.
+        Phase 1: (rotated_key, rotated_value) same shapes as input
+        Phase 2: (truncated_key, truncated_value) with last dim = spectral_rank
     """
     cal = get_calibration()
     if cal is None:
@@ -175,14 +219,21 @@ def rotate_kv(
     if lc is None:
         return key, value
 
-    # key: (T, H, D), V_k: (H, D, D)
-    # Batched matmul: transpose to (H, T, D) @ (H, D, D) -> (H, T, D)
     orig_dtype = key.dtype
-    k_float = key.transpose(0, 1).float()  # (H, T, D)
+    rank = _SPECTRAL_RANK  # None for Phase 1
+
+    # Use truncated rotation matrices if Phase 2
+    # V_k: (H, D, D) → V_k[:, :, :rank]: (H, D, rank)
+    k_rot = lc.k_rotation if rank is None else lc.k_rotation[:, :, :rank]
+    v_rot = lc.v_rotation if rank is None else lc.v_rotation[:, :, :rank]
+
+    # key: (T, H, D) → transpose to (H, T, D)
+    # matmul: (H, T, D) @ (H, D, rank_or_D) → (H, T, rank_or_D)
+    k_float = key.transpose(0, 1).float()
     v_float = value.transpose(0, 1).float()
 
-    k_rotated = torch.bmm(k_float, lc.k_rotation).transpose(0, 1)  # (T, H, D)
-    v_rotated = torch.bmm(v_float, lc.v_rotation).transpose(0, 1)
+    k_rotated = torch.bmm(k_float, k_rot).transpose(0, 1)  # (T, H, rank_or_D)
+    v_rotated = torch.bmm(v_float, v_rot).transpose(0, 1)
 
     return k_rotated.to(orig_dtype), v_rotated.to(orig_dtype)
 
@@ -194,6 +245,9 @@ def rotate_q(
     """
     Rotate Q tensor into spectral basis to match cached K rotation.
 
+    If Phase 2 (truncation) is active, Q is also truncated to spectral_rank
+    dims so it matches the truncated K cache for attention score computation.
+
     For GQA: each query head group shares the same K rotation.
 
     Args:
@@ -201,7 +255,8 @@ def rotate_q(
         layer_name: vLLM layer identifier
 
     Returns:
-        rotated query with same shape
+        Phase 1: rotated query with same shape
+        Phase 2: truncated query with last dim = spectral_rank
     """
     cal = get_calibration()
     if cal is None:
@@ -215,19 +270,18 @@ def rotate_q(
     num_q_heads = query.shape[1]
     num_kv_heads = lc.num_kv_heads
     group_size = num_q_heads // num_kv_heads
+    rank = _SPECTRAL_RANK
+
+    # Truncated rotation: (H_kv, D, D) → (H_kv, D, rank)
+    k_rot = lc.k_rotation if rank is None else lc.k_rotation[:, :, :rank]
 
     orig_dtype = query.dtype
 
     if group_size == 1:
-        # MHA or 1:1 mapping — simple batched matmul
         q_float = query.transpose(0, 1).float()  # (H, T, D)
-        q_rotated = torch.bmm(q_float, lc.k_rotation).transpose(0, 1)
+        q_rotated = torch.bmm(q_float, k_rot).transpose(0, 1)
     else:
-        # GQA: expand K rotation to match Q heads
-        # k_rotation: (num_kv_heads, D, D)
-        # Repeat each KV head's rotation for its query group
-        # (num_kv_heads, D, D) -> (num_q_heads, D, D)
-        expanded_rotation = lc.k_rotation.repeat_interleave(group_size, dim=0)
+        expanded_rotation = k_rot.repeat_interleave(group_size, dim=0)
         q_float = query.transpose(0, 1).float()  # (num_q_heads, T, D)
         q_rotated = torch.bmm(q_float, expanded_rotation).transpose(0, 1)
 
@@ -237,23 +291,24 @@ def rotate_q(
 def unrotate_output(
     output: torch.Tensor,
     layer_name: str,
+    full_head_dim: int | None = None,
 ) -> torch.Tensor:
     """
     Rotate attention output back from spectral basis.
 
-    The attention output is: out_rot = softmax(scores) @ V_cached
-    where V_cached is in spectral basis (V_v^T @ v).
-    So out_rot = V_v^T @ true_output, and we need:
-    true_output = V_v @ out_rot = out_rot @ V_v^T
+    Phase 1: output has full head_dim, unrotate with V_v^T.
+    Phase 2: output has spectral_rank dims, unrotate with V_v[:, :rank]^T
+             which expands back to full head_dim.
 
-    For GQA: each query head group shares the same V rotation.
+    Math: out @ V_v[:, :rank]^T = out @ V_v[:rank, :] → (T, H, full_D)
 
     Args:
-        output: (num_tokens, num_q_heads, head_dim_v)
+        output: (num_tokens, num_q_heads, spectral_rank_or_head_dim)
         layer_name: vLLM layer identifier
+        full_head_dim: original head dim (needed for Phase 2 expansion)
 
     Returns:
-        unrotated output with same shape
+        unrotated output with last dim = full_head_dim
     """
     cal = get_calibration()
     if cal is None:
@@ -267,20 +322,25 @@ def unrotate_output(
     num_q_heads = output.shape[1]
     num_kv_heads = lc.num_kv_heads
     group_size = num_q_heads // num_kv_heads
+    rank = _SPECTRAL_RANK
 
     orig_dtype = output.dtype
 
-    # Unrotation: out @ V_v^T (transpose of the rotation matrix)
-    # V_v: (num_kv_heads, D, D) — columns are eigenvectors
-    # V_v^T: (num_kv_heads, D, D) — rows are eigenvectors
-    v_rotation_T = lc.v_rotation.transpose(-2, -1)  # (H_kv, D, D)
+    # Unrotation matrix:
+    # Phase 1: V_v^T full (D, D) — just transpose
+    # Phase 2: V_v[:, :rank]^T = (rank, D) — maps rank dims back to full D
+    if rank is not None:
+        # (H_kv, D, rank) → transpose → (H_kv, rank, D)
+        v_unrot = lc.v_rotation[:, :, :rank].transpose(-2, -1)
+    else:
+        v_unrot = lc.v_rotation.transpose(-2, -1)  # (H_kv, D, D)
 
     if group_size == 1:
-        o_float = output.transpose(0, 1).float()  # (H, T, D)
-        o_unrotated = torch.bmm(o_float, v_rotation_T).transpose(0, 1)
+        o_float = output.transpose(0, 1).float()  # (H, T, rank_or_D)
+        o_unrotated = torch.bmm(o_float, v_unrot).transpose(0, 1)
     else:
-        expanded_rotation_T = v_rotation_T.repeat_interleave(group_size, dim=0)
+        expanded_unrot = v_unrot.repeat_interleave(group_size, dim=0)
         o_float = output.transpose(0, 1).float()
-        o_unrotated = torch.bmm(o_float, expanded_rotation_T).transpose(0, 1)
+        o_unrotated = torch.bmm(o_float, expanded_unrot).transpose(0, 1)
 
     return o_unrotated.to(orig_dtype)

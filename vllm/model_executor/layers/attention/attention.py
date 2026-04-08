@@ -449,11 +449,22 @@ class Attention(nn.Module, AttentionLayerBase):
         # SpectralQuant: rotate K, V, Q into spectral basis before caching
         # and attention. The orthogonal rotation preserves attention scores:
         # (V^T q)^T (V^T k) = q^T V V^T k = q^T k
+        # Phase 2 truncation: Q/K/V are truncated to spectral_rank dims.
         if spectral_cache.is_enabled():
             if key is not None and value is not None:
                 key, value = spectral_cache.rotate_kv(
                     key, value, self.layer_name)
             query = spectral_cache.rotate_q(query, self.layer_name)
+
+        # Phase 2: attention output has spectral_rank dims, not head_dim.
+        # Create a truncated output tensor for the attention kernel.
+        if spectral_cache.is_truncating():
+            rank = spectral_cache.get_spectral_rank()
+            attn_output = torch.empty(
+                (query.shape[0], self.num_heads, rank),
+                dtype=output_dtype, device=query.device)
+        else:
+            attn_output = output
 
         kv_cache_dummy_dep = None
         if self.use_direct_call:
@@ -471,7 +482,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 query,
                 key,
                 value,
-                output,
+                attn_output,
                 self.layer_name,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
@@ -490,14 +501,17 @@ class Attention(nn.Module, AttentionLayerBase):
                 query,
                 key,
                 value,
-                output,
+                attn_output,
                 self.layer_name,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
 
-        # SpectralQuant: unrotate output from spectral basis back to original
+        # SpectralQuant: unrotate output from spectral basis back to original.
+        # Phase 2: unrotation also expands from spectral_rank → head_dim.
         if spectral_cache.is_enabled():
-            output = spectral_cache.unrotate_output(output, self.layer_name)
+            output = spectral_cache.unrotate_output(
+                attn_output, self.layer_name, self.head_size_v)
+            return output.reshape(-1, hidden_size)
 
         return output.view(-1, hidden_size)
 
@@ -542,6 +556,12 @@ class Attention(nn.Module, AttentionLayerBase):
         # Should not be called for enc-dec or encoder-only attention.
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+
+        # SpectralQuant Phase 2: use reduced head_size for cache allocation
+        spectral_hs = spectral_cache.get_spectral_head_size(self.layer_name)
+        cache_head_size = spectral_hs if spectral_hs is not None else self.head_size
+        cache_head_size_v = spectral_hs if spectral_hs is not None else self.head_size_v
+
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
                 "MLA is not supported for slidingwindow"
@@ -549,7 +569,7 @@ class Attention(nn.Module, AttentionLayerBase):
             return SlidingWindowSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
+                head_size=cache_head_size,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
                 sliding_window=self.sliding_window,
@@ -558,8 +578,8 @@ class Attention(nn.Module, AttentionLayerBase):
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-                head_size_v=self.head_size_v,
+                head_size=cache_head_size,
+                head_size_v=cache_head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
             )

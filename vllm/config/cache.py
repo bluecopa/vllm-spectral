@@ -174,6 +174,12 @@ class CacheConfig:
     FP8 cache quality by concentrating signal into first d_eff dimensions.
     Generate with: python phase9_calibrate_sidecar.py"""
 
+    spectral_rank: int | None = None
+    """When set with --spectral-calibration, truncates the KV cache to this
+    many spectral dimensions per head instead of full head_dim. This gives
+    actual memory savings (e.g., 32 → 8x compression for 256-dim heads).
+    If None, no truncation (Phase 1 rotation only). Recommended: 16-32."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
