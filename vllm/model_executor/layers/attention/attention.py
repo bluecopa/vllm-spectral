@@ -638,25 +638,9 @@ def unified_kv_cache_update(
     Returns a dummy that is passed to unified_attention to signal a side effect and
     the data dependency between them to ensure torch.compile preserves ordering.
     """
-    # Unconditional trace to check if op body runs during inference
-    import os
-    with open("/tmp/spectral_trace.log", "a") as f:
-        _sc_n = getattr(unified_kv_cache_update, '_n', 0)
-        f.write(f"OP_BODY {_sc_n} {layer_name} enabled={spectral_cache.is_enabled()}\n")
-        unified_kv_cache_update._n = _sc_n + 1
-
     # SpectralQuant: rotate K/V into spectral basis before caching
     if spectral_cache.is_enabled():
-        k_norm_before = key.float().norm().item()
         key, value = spectral_cache.rotate_kv(key, value, layer_name)
-        k_norm_after = key.float().norm().item()
-        # Only log non-zero tensors (skip warmup padding)
-        if k_norm_before > 0.01:
-            _sc_n2 = getattr(unified_kv_cache_update, '_sanity', 0)
-            if _sc_n2 < 5:
-                with open("/tmp/spectral_sanity.log", "a") as f:
-                    f.write(f"KV {layer_name}: norm_before={k_norm_before:.4f} norm_after={k_norm_after:.4f} ratio={k_norm_after/max(k_norm_before,1e-8):.6f} has_nan={key.isnan().any().item()}\n")
-            unified_kv_cache_update._sanity = _sc_n2 + 1
 
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
     if layer_slot_mapping is not None:
@@ -709,11 +693,6 @@ def unified_attention_with_output(
 
     # SpectralQuant: rotate Q to match cached rotated K
     if spectral_cache.is_enabled():
-        import os
-        with open("/tmp/spectral_trace.log", "a") as f:
-            _sc_n2 = getattr(unified_attention_with_output, '_n', 0)
-            f.write(f"Q {_sc_n2} {layer_name} {list(query.shape)}\n")
-            unified_attention_with_output._n = _sc_n2 + 1
         query = spectral_cache.rotate_q(query, layer_name)
 
     self.impl.forward(
