@@ -640,13 +640,11 @@ def unified_kv_cache_update(
     """
     # SpectralQuant: rotate K/V into spectral basis before caching
     if spectral_cache.is_enabled():
-        _sc_debug = getattr(unified_kv_cache_update, '_debug_count', 0)
-        if _sc_debug < 180:  # Log first 3 full forward passes (60 layers each)
-            import os
-            with open("/tmp/spectral_trace.log", "a") as f:
-                f.write(f"KV_ROTATE call={_sc_debug} layer={layer_name} "
-                        f"key={list(key.shape)} enabled={spectral_cache.is_enabled()}\n")
-        unified_kv_cache_update._debug_count = _sc_debug + 1
+        import os
+        with open("/tmp/spectral_trace.log", "a") as f:
+            _sc_n = getattr(unified_kv_cache_update, '_n', 0)
+            f.write(f"KV {_sc_n} {layer_name} {list(key.shape)}\n")
+            unified_kv_cache_update._n = _sc_n + 1
         key, value = spectral_cache.rotate_kv(key, value, layer_name)
 
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
@@ -700,13 +698,11 @@ def unified_attention_with_output(
 
     # SpectralQuant: rotate Q to match cached rotated K
     if spectral_cache.is_enabled():
-        _sc_debug2 = getattr(unified_attention_with_output, '_debug_count', 0)
-        if _sc_debug2 < 180:
-            import os
-            with open("/tmp/spectral_trace.log", "a") as f:
-                f.write(f"Q_ROTATE call={_sc_debug2} layer={layer_name} "
-                        f"query={list(query.shape)}\n")
-        unified_attention_with_output._debug_count = _sc_debug2 + 1
+        import os
+        with open("/tmp/spectral_trace.log", "a") as f:
+            _sc_n2 = getattr(unified_attention_with_output, '_n', 0)
+            f.write(f"Q {_sc_n2} {layer_name} {list(query.shape)}\n")
+            unified_attention_with_output._n = _sc_n2 + 1
         query = spectral_cache.rotate_q(query, layer_name)
 
     self.impl.forward(
