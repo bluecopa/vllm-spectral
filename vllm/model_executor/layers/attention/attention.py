@@ -707,9 +707,13 @@ def unified_attention_with_output(
     )
 
     # SpectralQuant: unrotate output from spectral basis
-    if spectral_cache.is_enabled():
-        output_unrot = spectral_cache.unrotate_output(output, layer_name)
-        output.copy_(output_unrot)
+    # NOTE: temporarily disabled to debug — with perfect orthogonal rotation,
+    # skipping unrotation should produce different but structured output
+    # (not random garbage). If output is still garbage, the issue is
+    # in the KV/Q rotation, not unrotation.
+    #if spectral_cache.is_enabled():
+    #    output_unrot = spectral_cache.unrotate_output(output, layer_name)
+    #    output.copy_(output_unrot)
 
 
 def unified_attention_with_output_fake(
