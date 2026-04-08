@@ -638,13 +638,15 @@ def unified_kv_cache_update(
     Returns a dummy that is passed to unified_attention to signal a side effect and
     the data dependency between them to ensure torch.compile preserves ordering.
     """
+    # Unconditional trace to check if op body runs during inference
+    import os
+    with open("/tmp/spectral_trace.log", "a") as f:
+        _sc_n = getattr(unified_kv_cache_update, '_n', 0)
+        f.write(f"OP_BODY {_sc_n} {layer_name} enabled={spectral_cache.is_enabled()}\n")
+        unified_kv_cache_update._n = _sc_n + 1
+
     # SpectralQuant: rotate K/V into spectral basis before caching
     if spectral_cache.is_enabled():
-        import os
-        with open("/tmp/spectral_trace.log", "a") as f:
-            _sc_n = getattr(unified_kv_cache_update, '_n', 0)
-            f.write(f"KV {_sc_n} {layer_name} {list(key.shape)}\n")
-            unified_kv_cache_update._n = _sc_n + 1
         key, value = spectral_cache.rotate_kv(key, value, layer_name)
 
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
