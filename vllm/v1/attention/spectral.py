@@ -30,6 +30,7 @@ import os
 from dataclasses import dataclass
 
 import torch
+import torch.compiler
 
 from vllm.logger import init_logger
 
@@ -164,6 +165,7 @@ def get_calibration() -> SpectralCalibration | None:
     return next(iter(_SPECTRAL_REGISTRY.values()))
 
 
+@torch.compiler.disable
 def is_enabled() -> bool:
     """Check if spectral rotation is active."""
     return _SPECTRAL_ENABLED
@@ -190,6 +192,7 @@ def get_spectral_head_size(layer_name: str) -> int | None:
     return _SPECTRAL_RANK
 
 
+@torch.compiler.disable
 def rotate_kv(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -238,6 +241,7 @@ def rotate_kv(
     return k_rotated.to(orig_dtype), v_rotated.to(orig_dtype)
 
 
+@torch.compiler.disable
 def rotate_q(
     query: torch.Tensor,
     layer_name: str,
@@ -288,6 +292,7 @@ def rotate_q(
     return q_rotated.to(orig_dtype)
 
 
+@torch.compiler.disable
 def unrotate_output(
     output: torch.Tensor,
     layer_name: str,
