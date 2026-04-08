@@ -4751,6 +4751,14 @@ class GPUModelRunner(
                 self.model = model_loader.load_model(
                     vllm_config=self.vllm_config, model_config=self.model_config
                 )
+                # Initialize SpectralQuant in the worker process
+                if self.vllm_config.cache_config.spectral_calibration:
+                    from vllm.v1.attention import spectral as spectral_cache
+                    spectral_cache.init_spectral(
+                        self.vllm_config.cache_config.spectral_calibration,
+                        spectral_rank=self.vllm_config.cache_config.spectral_rank,
+                        device=self.device,
+                    )
                 if self.lora_config:
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
