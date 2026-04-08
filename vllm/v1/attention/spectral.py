@@ -238,7 +238,14 @@ def rotate_kv(
     k_rotated = torch.bmm(k_float, k_rot).transpose(0, 1)  # (T, H, rank_or_D)
     v_rotated = torch.bmm(v_float, v_rot).transpose(0, 1)
 
-    return k_rotated.to(orig_dtype), v_rotated.to(orig_dtype)
+    if rank is None:
+        # Phase 1: same shape — copy in-place to preserve tensor identity
+        # This is critical for torch.compile which may trace tensor pointers
+        key.copy_(k_rotated.to(orig_dtype))
+        value.copy_(v_rotated.to(orig_dtype))
+        return key, value
+    else:
+        return k_rotated.to(orig_dtype), v_rotated.to(orig_dtype)
 
 
 @torch.compiler.disable
@@ -289,7 +296,12 @@ def rotate_q(
         q_float = query.transpose(0, 1).float()  # (num_q_heads, T, D)
         q_rotated = torch.bmm(q_float, expanded_rotation).transpose(0, 1)
 
-    return q_rotated.to(orig_dtype)
+    if rank is None:
+        # In-place copy to preserve tensor identity for torch.compile
+        query.copy_(q_rotated.to(orig_dtype))
+        return query
+    else:
+        return q_rotated.to(orig_dtype)
 
 
 @torch.compiler.disable
