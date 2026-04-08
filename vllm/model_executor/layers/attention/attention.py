@@ -28,6 +28,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     kv_cache_dtype_str_to_dtype,
 )
+from vllm.v1.attention import spectral as spectral_cache
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionType,
@@ -444,6 +445,16 @@ class Attention(nn.Module, AttentionLayerBase):
             key = key.view(-1, self.num_kv_heads, self.head_size)
         if value is not None:
             value = value.view(-1, self.num_kv_heads, self.head_size_v)
+
+        # SpectralQuant: rotate K, V, Q into spectral basis before caching
+        # and attention. The orthogonal rotation preserves attention scores:
+        # (V^T q)^T (V^T k) = q^T V V^T k = q^T k
+        if spectral_cache.is_enabled():
+            if key is not None and value is not None:
+                key, value = spectral_cache.rotate_kv(
+                    key, value, self.layer_name)
+            query = spectral_cache.rotate_q(query, self.layer_name)
+
         kv_cache_dummy_dep = None
         if self.use_direct_call:
             # Skip this if sharing KV cache with an earlier attention layer.
@@ -483,6 +494,11 @@ class Attention(nn.Module, AttentionLayerBase):
                 self.layer_name,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
+
+        # SpectralQuant: unrotate output from spectral basis back to original
+        if spectral_cache.is_enabled():
+            output = spectral_cache.unrotate_output(output, self.layer_name)
+
         return output.view(-1, hidden_size)
 
     def calc_kv_scales(self, query, key, value):

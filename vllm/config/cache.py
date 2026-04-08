@@ -168,6 +168,12 @@ class CacheConfig:
     'native' (vLLM native CPU offloading), 'lmcache'.
     KV offloading is only activated when kv_offloading_size is set."""
 
+    spectral_calibration: str | None = None
+    """File path to SpectralQuant calibration sidecar (.pt). When set, KV cache
+    activations are rotated into spectral basis before storage. This improves
+    FP8 cache quality by concentrating signal into first d_eff dimensions.
+    Generate with: python phase9_calibrate_sidecar.py"""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
