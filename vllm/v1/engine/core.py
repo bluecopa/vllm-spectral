@@ -115,6 +115,12 @@ class EngineCore:
         if executor_fail_callback is not None:
             self.model_executor.register_failure_callback(executor_fail_callback)
 
+        # Initialize SpectralQuant cache rotation if configured.
+        if vllm_config.cache_config.spectral_calibration:
+            from vllm.v1.attention import spectral as spectral_cache
+            spectral_cache.init_spectral(
+                vllm_config.cache_config.spectral_calibration)
+
         self.available_gpu_memory_for_kv_cache = -1
 
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:

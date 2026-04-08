@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 import torch.nn as nn
 
+from vllm.v1.attention import spectral as spectral_cache
 import vllm.envs as envs
 from vllm.config import CacheConfig, get_current_vllm_config
 from vllm.config.vllm import VllmConfig
@@ -429,6 +430,14 @@ class Attention(nn.Module, AttentionLayerBase):
             if self.impl.supports_quant_query_input:
                 query, _ = self.query_quant(query, self._q_scale)
 
+        # SpectralQuant: rotate K, V, Q into spectral basis before caching
+        # and attention. The orthogonal rotation preserves attention scores.
+        if spectral_cache.is_enabled():
+            if key is not None and value is not None:
+                key, value = spectral_cache.rotate_kv(key, value, self.layer_name)
+            query = spectral_cache.rotate_q(query, self.layer_name)
+
+
         if self.use_output:
             if output_shape is None:
                 # Handle both 2D [num_tokens, hidden] and
@@ -487,6 +496,10 @@ class Attention(nn.Module, AttentionLayerBase):
                     self.layer_name,
                     kv_cache_dummy_dep=kv_cache_dummy_dep,
                 )
+            # SpectralQuant: unrotate output from spectral basis
+            if spectral_cache.is_enabled():
+                output = spectral_cache.unrotate_output(output, self.layer_name)
+
             return output.view(-1, hidden_size)
         else:
             assert self.attn_backend.forward_includes_kv_cache_update, (
