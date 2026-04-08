@@ -638,9 +638,9 @@ def unified_kv_cache_update(
     Returns a dummy that is passed to unified_attention to signal a side effect and
     the data dependency between them to ensure torch.compile preserves ordering.
     """
-    # SpectralQuant: rotate K/V into spectral basis before caching
-    if spectral_cache.is_enabled():
-        key, value = spectral_cache.rotate_kv(key, value, layer_name)
+    # SpectralQuant: DISABLED for debugging
+    #if spectral_cache.is_enabled():
+    #    key, value = spectral_cache.rotate_kv(key, value, layer_name)
 
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
     if layer_slot_mapping is not None:
@@ -691,9 +691,9 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
 
-    # SpectralQuant: rotate Q to match cached rotated K
-    if spectral_cache.is_enabled():
-        query = spectral_cache.rotate_q(query, layer_name)
+    # SpectralQuant: DISABLED for debugging
+    #if spectral_cache.is_enabled():
+    #    query = spectral_cache.rotate_q(query, layer_name)
 
     self.impl.forward(
         self,
