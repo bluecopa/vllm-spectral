@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -535,6 +536,10 @@ class Attention(nn.Module, AttentionLayerBase):
 
         cache_head_size = self.head_size
         cache_head_size_v = self.head_size_v
+        spectral_head_size = spectral_cache.get_spectral_head_size(self.layer_name)
+        if spectral_head_size is not None:
+            cache_head_size = spectral_head_size
+            cache_head_size_v = spectral_head_size
 
         if self.sliding_window is not None:
             assert not vllm_config.model_config.use_mla, (
@@ -638,22 +643,42 @@ def unified_kv_cache_update(
     Returns a dummy that is passed to unified_attention to signal a side effect and
     the data dependency between them to ensure torch.compile preserves ordering.
     """
-    # SpectralQuant: rotate K/V into spectral basis before caching
-    if spectral_cache.is_enabled():
-        key, value = spectral_cache.rotate_kv(key, value, layer_name)
-
     _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
         )
-        attn_layer.impl.do_kv_cache_update(
-            attn_layer,
-            key,
-            value,
-            kv_cache,
-            layer_slot_mapping,
-        )
+        if spectral_cache.is_phase2_quantized(layer_name):
+            if spectral_cache.is_deferred_compress():
+                # Deferred compress: stash raw K/V for injection in attention
+                spectral_cache.stash_kv_for_deferred_compress(
+                    key, value, layer_name, layer_slot_mapping,
+                )
+            else:
+                # Immediate compress: quantize + write indices to cache
+                spectral_cache.compress_kv(
+                    key, value, layer_name, attn_layer, kv_cache,
+                    layer_slot_mapping,
+                )
+        elif spectral_cache.uses_compressed_cache(layer_name):
+            spectral_cache.store_compressed_kv(
+                key,
+                value,
+                kv_cache,
+                layer_slot_mapping,
+                layer_name,
+            )
+        else:
+            # SpectralQuant Phase 1: rotate K/V into spectral basis before caching.
+            if spectral_cache.is_enabled():
+                key, value = spectral_cache.rotate_kv(key, value, layer_name)
+            attn_layer.impl.do_kv_cache_update(
+                attn_layer,
+                key,
+                value,
+                kv_cache,
+                layer_slot_mapping,
+            )
 
     return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 
@@ -691,7 +716,43 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     attn_metadata, self, kv_cache, _ = get_attention_context(layer_name)
 
-    # SpectralQuant: rotate Q to match cached rotated K
+    if spectral_cache.is_phase2_quantized(layer_name):
+        # SpectralQuant Phase 2: dequantize from cache + attend
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                "SpectralQuant Phase 2 does not support fused output quantization yet."
+            )
+        if os.environ.get("SPECTRAL_CUSTOM_ATTN", "") == "1":
+            # Old path: custom matmul attention in rotated basis (for debug)
+            spectral_cache.spectral_attention_phase2(
+                query, output, layer_name, kv_cache, attn_metadata,
+                self.impl.scale,
+            )
+        else:
+            # New path: dequant to bf16 buffer + Triton paged attention
+            spectral_cache.spectral_phase2_triton_attention(
+                query, output, layer_name, kv_cache, attn_metadata,
+                self.impl,
+            )
+        return
+
+    if spectral_cache.uses_compressed_cache(layer_name):
+        if output_scale is not None or output_block_scale is not None:
+            raise NotImplementedError(
+                "Compressed SpectralQuant attention does not support fused "
+                "output quantization yet."
+            )
+        spectral_cache.compressed_attention(
+            query,
+            output,
+            kv_cache,
+            attn_metadata,
+            layer_name,
+            self.impl.scale,
+        )
+        return
+
+    # SpectralQuant Phase 1: rotate Q to match cached rotated K.
     if spectral_cache.is_enabled():
         query = spectral_cache.rotate_q(query, layer_name)
 
@@ -707,7 +768,7 @@ def unified_attention_with_output(
         output_block_scale=output_block_scale,
     )
 
-    # SpectralQuant: unrotate output from spectral basis
+    # SpectralQuant Phase 1: unrotate output from spectral basis.
     if spectral_cache.is_enabled():
         output_unrot = spectral_cache.unrotate_output(output, layer_name)
         output.copy_(output_unrot)

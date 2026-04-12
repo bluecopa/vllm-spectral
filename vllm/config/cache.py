@@ -164,6 +164,12 @@ class CacheConfig:
     actual memory savings (e.g., 32 → 8x compression for 256-dim heads).
     If None, no truncation (Phase 1 rotation only). Recommended: 16-32."""
 
+    spectral_quantize: bool = False
+    """When set with --spectral-calibration, enables Phase 2 non-uniform
+    quantization on global attention layers. Uses Lloyd-Max codebooks to
+    quantize semantic dims at 6 bits and tail dims at 4 bits. Requires
+    v2 sidecar with eigenvalues. Local layers keep Phase 1 rotation."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,

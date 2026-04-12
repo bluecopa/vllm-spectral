@@ -4757,6 +4757,7 @@ class GPUModelRunner(
                     spectral_cache.init_spectral(
                         self.vllm_config.cache_config.spectral_calibration,
                         spectral_rank=self.vllm_config.cache_config.spectral_rank,
+                        spectral_quantize=self.vllm_config.cache_config.spectral_quantize,
                         device=self.device,
                     )
                 if self.lora_config:
@@ -4909,10 +4910,17 @@ class GPUModelRunner(
             return None
 
         hf_config = self.speculative_config.draft_model_config.hf_config
-        if not hasattr(hf_config, "eagle_aux_hidden_state_layer_ids"):
-            return None
+        layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        if not layer_ids:
+            # Check inside eagle_config dict (some models nest it there)
+            eagle_config = getattr(hf_config, "eagle_config", None)
+            if eagle_config and isinstance(eagle_config, dict):
+                layer_ids = eagle_config.get("eagle_aux_hidden_state_layer_ids")
+        if not layer_ids:
+            dflash_config = getattr(hf_config, "dflash_config", None)
+            if dflash_config and isinstance(dflash_config, dict):
+                layer_ids = dflash_config.get("target_layer_ids")
 
-        layer_ids = hf_config.eagle_aux_hidden_state_layer_ids
         if layer_ids and isinstance(layer_ids, (list, tuple)):
             return tuple(layer_ids)
 
@@ -6805,6 +6813,25 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+
+        # Initialize Phase 2 norm buffer if spectral quantization is enabled.
+        if self.vllm_config.cache_config.spectral_quantize:
+            from vllm.v1.attention import spectral as spectral_cache
+            # Compute max_slots as the maximum across ALL cache tensors,
+            # since different layer types can have different block_sizes
+            # (e.g. global block_size=32 vs local block_size=16).
+            if kv_caches:
+                max_slots = 0
+                for cache in kv_caches.values():
+                    if cache.ndim == 5:
+                        slots = cache.shape[0] * cache.shape[2]
+                    else:
+                        slots = cache.shape[0] * cache.shape[1]
+                    max_slots = max(max_slots, slots)
+                spectral_cache.init_norm_buffer(max_slots, device=self.device)
+                spectral_cache.init_dequant_buffer(
+                    kv_caches, device=self.device,
+                )
 
         if (
             self.speculative_config

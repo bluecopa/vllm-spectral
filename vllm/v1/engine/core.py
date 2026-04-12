@@ -20,7 +20,7 @@ import msgspec
 import zmq
 
 import vllm.envs as envs
-from vllm.config import ParallelConfig, VllmConfig
+from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.distributed import stateless_destroy_torch_distributed_process_group
 from vllm.envs import enable_envs_cache
 from vllm.logger import init_logger
@@ -110,6 +110,35 @@ class EngineCore:
 
         self.log_stats = log_stats
 
+        _spectral_cuda_graph = os.environ.get("SPECTRAL_CUDA_GRAPH", "0") == "1"
+        _needs_disable_cg = (
+            vllm_config.cache_config.spectral_rank is not None
+            or (vllm_config.cache_config.spectral_quantize
+                and not _spectral_cuda_graph)
+        )
+        if _needs_disable_cg:
+            compilation_config = vllm_config.compilation_config
+            if compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
+                if (vllm_config.cache_config.spectral_quantize
+                        and not _spectral_cuda_graph):
+                    logger.info(
+                        "Disabling CUDA graph capture for SpectralQuant "
+                        "Phase 2 (set SPECTRAL_CUDA_GRAPH=1 to re-enable)."
+                    )
+                elif vllm_config.cache_config.spectral_rank is not None:
+                    logger.info(
+                        "Disabling CUDA graph capture for SpectralQuant compressed-cache mode."
+                    )
+            compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+            compilation_config.cudagraph_capture_sizes = []
+            compilation_config.max_cudagraph_capture_size = 0
+        elif (vllm_config.cache_config.spectral_quantize
+              and _spectral_cuda_graph):
+            logger.info(
+                "SPECTRAL_CUDA_GRAPH=1: keeping CUDA graphs enabled for "
+                "Phase 2 (scatter+cumsum block gathering, fixed-grid dequant)."
+            )
+
         # Setup Model.
         self.model_executor = executor_class(vllm_config)
         if executor_fail_callback is not None:
@@ -121,6 +150,7 @@ class EngineCore:
             spectral_cache.init_spectral(
                 vllm_config.cache_config.spectral_calibration,
                 spectral_rank=vllm_config.cache_config.spectral_rank,
+                spectral_quantize=vllm_config.cache_config.spectral_quantize,
             )
 
         self.available_gpu_memory_for_kv_cache = -1

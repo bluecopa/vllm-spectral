@@ -1123,32 +1123,52 @@ def get_kv_cache_config_from_groups(
             for layer_name in kv_cache_groups[0].layer_names
         ]
     else:
-        # General case:
-        # We will have group_size memory pools, each is shared by one layer from
-        # each group. As layers of different groups have different block table,
-        # they will use different parts of the shared Tensor.
-        # The memory layout for 3 groups (full.0, full.1), (sw.0, sw.2),
-        # (sw.1, padding) will be: (group_size = 2)
-        # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
-        # full.1, sw.2: share another Tensor with size=available_memory//2
-        group_size = max(len(group.layer_names) for group in kv_cache_groups)
-
-        page_size = get_uniform_page_size(
-            [group.kv_cache_spec for group in kv_cache_groups]
-        )
-        assert group_size > 0, "group_size must be greater than 0"
-        num_blocks = get_num_blocks(
-            vllm_config, group_size, available_memory, page_size
-        )
-        kv_cache_tensors = []
-        for i in range(group_size):
-            shared_by = []
-            for j in range(len(kv_cache_groups)):
-                if i < len(kv_cache_groups[j].layer_names):
-                    shared_by.append(kv_cache_groups[j].layer_names[i])
-            kv_cache_tensors.append(
-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+        # Check if page sizes are non-uniform across groups
+        group_page_sizes = {
+            g.kv_cache_spec.page_size_bytes for g in kv_cache_groups
+        }
+        if len(group_page_sizes) > 1:
+            # Non-uniform page sizes (e.g. SpectralQuant with different
+            # packed_dims per head_dim group). Allocate per-layer tensors.
+            total_per_block = sum(
+                g.kv_cache_spec.page_size_bytes * len(g.layer_names)
+                for g in kv_cache_groups
             )
+            num_blocks = int(available_memory // total_per_block)
+            num_blocks = max(num_blocks, 0)
+            num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+            kv_cache_tensors = []
+            for group in kv_cache_groups:
+                page_size = group.kv_cache_spec.page_size_bytes
+                for layer_name in group.layer_names:
+                    kv_cache_tensors.append(
+                        KVCacheTensor(
+                            size=page_size * num_blocks,
+                            shared_by=[layer_name],
+                        )
+                    )
+        else:
+            # General case: uniform page size across groups.
+            # We will have group_size memory pools, each is shared by one layer
+            # from each group.
+            group_size = max(len(group.layer_names) for group in kv_cache_groups)
+
+            page_size = get_uniform_page_size(
+                [group.kv_cache_spec for group in kv_cache_groups]
+            )
+            assert group_size > 0, "group_size must be greater than 0"
+            num_blocks = get_num_blocks(
+                vllm_config, group_size, available_memory, page_size
+            )
+            kv_cache_tensors = []
+            for i in range(group_size):
+                shared_by = []
+                for j in range(len(kv_cache_groups)):
+                    if i < len(kv_cache_groups[j].layer_names):
+                        shared_by.append(kv_cache_groups[j].layer_names[i])
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+                )
 
     return KVCacheConfig(
         num_blocks=num_blocks,
@@ -1251,14 +1271,14 @@ def get_kv_cache_groups(
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
 
-    # As KVCacheManager can only allocate memory of one size, we need to unify
-    # the page size of the layers. For cases cannot be unified, this function
-    # will raise an error.
-    kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
-    # Model contains multiple attention types, but KV cache of all layers
-    # have the same physical memory per block per layer. Split the layers
-    # into groups with the same number of layers, and thus same total page
-    # size.
+    # Try to unify page sizes across layers. If page sizes are incompatible
+    # (e.g. SpectralQuant packed_dim not a multiple of local head_dim),
+    # proceed without unification — get_kv_cache_config_from_groups handles
+    # the non-uniform case with per-layer tensor allocation.
+    try:
+        kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
+    except NotImplementedError:
+        pass
     return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
 
 
@@ -1353,8 +1373,22 @@ def _max_memory_usage_bytes_from_groups(
             for spec in per_layer_specs.values()
         )
 
-    # General case: group_size pools, each shared by one layer per group
-    # Memory = group_size * page_size * blocks_for_max_len
+    # General case: compute memory across groups.
+    group_page_sizes = {
+        g.kv_cache_spec.page_size_bytes for g in kv_cache_groups
+    }
+    if len(group_page_sizes) > 1:
+        # Non-uniform page sizes: per-layer tensors, each sized independently.
+        # Total = sum over all layers of (page_size * blocks_for_max_len)
+        total = 0
+        for group in kv_cache_groups:
+            ps = group.kv_cache_spec.page_size_bytes
+            max_mem = group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+            blocks = cdiv(max_mem, ps)
+            total += ps * blocks * len(group.layer_names)
+        return total
+
+    # Uniform page sizes: group_size pools, each shared by one layer per group
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
     page_size = get_uniform_page_size(
         [group.kv_cache_spec for group in kv_cache_groups]

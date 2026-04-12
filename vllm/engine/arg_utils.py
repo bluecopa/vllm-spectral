@@ -627,6 +627,7 @@ class EngineArgs:
     kv_offloading_backend: KVOffloadingBackend = CacheConfig.kv_offloading_backend
     spectral_calibration: str | None = CacheConfig.spectral_calibration
     spectral_rank: int | None = CacheConfig.spectral_rank
+    spectral_quantize: bool = CacheConfig.spectral_quantize
     tokens_only: bool = False
 
     shutdown_timeout: int = 0
@@ -1037,6 +1038,9 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--spectral-rank", **cache_kwargs["spectral_rank"]
+        )
+        cache_group.add_argument(
+            "--spectral-quantize", **cache_kwargs["spectral_quantize"]
         )
 
         # Model weight offload related configs
@@ -1577,6 +1581,17 @@ class EngineArgs:
             self.kv_cache_dtype, model_config
         )
 
+        if self.spectral_quantize:
+            if not self.spectral_calibration:
+                raise ValueError(
+                    "--spectral-quantize requires --spectral-calibration."
+                )
+            if self.spectral_rank is not None:
+                raise ValueError(
+                    "--spectral-quantize cannot be combined with --spectral-rank. "
+                    "They are alternative Phase 2 approaches."
+                )
+
         assert self.enable_prefix_caching is not None, (
             "enable_prefix_caching must be set by this point"
         )
@@ -1602,6 +1617,7 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
             spectral_calibration=self.spectral_calibration,
             spectral_rank=self.spectral_rank,
+            spectral_quantize=self.spectral_quantize,
         )
 
         ray_runtime_env = None
