@@ -89,12 +89,11 @@ class LayerCodebooks:
 _LAYER_CODEBOOKS: dict[int, LayerCodebooks] = {}
 
 # Per-layer packed dim registry: layer_idx -> packed_dim.
-# Packed_dim is the max within each head_dim group (e.g. 326 for global
-# head_dim=512, 133 for local head_dim=256).
+# Packed_dim is the max required width within that layer across K/V heads.
 _PACKED_DIMS: dict[int, int] = {}  # layer_idx -> packed_dim
 
-# Per-layer allocation dim: may be padded above packed_dim so that page_sizes
-# are divisible across layer types (enabling shared-tensor allocation).
+# Per-layer allocation dim: defaults to packed_dim. It may be padded above
+# packed_dim when SPECTRAL_SHARED_ALLOC=1 to preserve shared-tensor allocation.
 _ALLOC_DIMS: dict[int, int] = {}  # layer_idx -> alloc_dim (>= packed_dim)
 
 # Vectorized pack/unpack maps: precomputed index tensors for batch bit-packing.
@@ -610,6 +609,12 @@ def _init_phase2_codebooks(
     device: str,
 ) -> None:
     """Compute and register Lloyd-Max codebooks for all Phase 2 layers."""
+    _LAYER_CODEBOOKS.clear()
+    _PACKED_DIMS.clear()
+    _ALLOC_DIMS.clear()
+    _PACK_MAPS.clear()
+    _UNPACK_MAPS.clear()
+
     # Optional: skip specific layers (keep them on Phase 1 rotation+fp8).
     # For Eagle3 compatibility, skip layers feeding aux hidden states.
     _skip_raw = os.environ.get("SPECTRAL_SKIP_LAYERS", "")
@@ -637,8 +642,9 @@ def _init_phase2_codebooks(
             layer_idx, codebooks.k_d_eff_int, codebooks.v_d_eff_int,
         )
 
-    # Compute max packed_dim per head_dim group so layers with different
-    # head_dims (e.g. 512 global, 256 local) get appropriately sized caches.
+    # Compute each layer's packed_dim. We also keep the old per-head_dim maxima
+    # only for logging/diagnostics; allocation should not use them by default
+    # because one outlier layer can otherwise inflate every layer in the group.
     per_hdim_packed: dict[int, int] = {}
     per_layer_packed: dict[int, int] = {}
     for layer_idx, codebooks in _LAYER_CODEBOOKS.items():
@@ -651,12 +657,15 @@ def _init_phase2_codebooks(
             )
 
     for layer_idx in _LAYER_CODEBOOKS:
-        lc = calibration.get_layer(layer_idx)
-        if lc is not None:
-            _PACKED_DIMS[layer_idx] = per_hdim_packed[lc.head_dim]
+        if layer_idx in per_layer_packed:
+            _PACKED_DIMS[layer_idx] = per_layer_packed[layer_idx]
 
-    # Compute padded alloc dims for page_size unification (shared tensors).
-    _compute_alloc_dims(calibration)
+    # Default to true per-layer allocation. The old padded/shared allocation
+    # mode is still available for A/B testing allocator utilization.
+    if os.environ.get("SPECTRAL_SHARED_ALLOC", "0") == "1":
+        _compute_alloc_dims(calibration)
+    else:
+        _ALLOC_DIMS.update(_PACKED_DIMS)
 
     # Precompute vectorized pack/unpack index maps for all layers.
     for layer_idx, codebooks in _LAYER_CODEBOOKS.items():
@@ -680,15 +689,13 @@ def _init_phase2_codebooks(
 
     logger.info(
         "Phase 2 codebooks initialized for %d layers, "
-        "packed_dim per head_dim=%s, alloc_dim per head_dim=%s "
-        "(per-layer raw: %s)",
+        "packed_dim per layer=%s, alloc_dim per layer=%s "
+        "(per-head_dim maxima: %s, shared_alloc=%s)",
         len(_LAYER_CODEBOOKS),
-        {k: v for k, v in sorted(per_hdim_packed.items())},
-        {hd: _ALLOC_DIMS.get(next(li for li in _LAYER_CODEBOOKS
-                                   if calibration.get_layer(li) is not None
-                                   and calibration.get_layer(li).head_dim == hd), 0)
-         for hd in sorted(per_hdim_packed)},
         {k: v for k, v in sorted(per_layer_packed.items())},
+        {k: v for k, v in sorted(_ALLOC_DIMS.items())},
+        {k: v for k, v in sorted(per_hdim_packed.items())},
+        os.environ.get("SPECTRAL_SHARED_ALLOC", "0") == "1",
     )
 
 
@@ -707,12 +714,17 @@ def _compute_alloc_dims(calibration: "SpectralCalibration") -> None:
     60 individual per-layer tensors, giving ~4-6× better block
     utilisation for hybrid models.
     """
-    # Group by head_dim -> (num_kv_heads, packed_dim)
+    # Group by head_dim -> (num_kv_heads, max packed_dim in that head_dim group)
     groups: dict[int, tuple[int, int]] = {}
     for layer_idx, packed_dim in _PACKED_DIMS.items():
         lc = calibration.get_layer(layer_idx)
-        if lc is not None and lc.head_dim not in groups:
+        if lc is None:
+            continue
+        if lc.head_dim not in groups:
             groups[lc.head_dim] = (lc.num_kv_heads, packed_dim)
+        else:
+            H, group_packed_dim = groups[lc.head_dim]
+            groups[lc.head_dim] = (H, max(group_packed_dim, packed_dim))
 
     if len(groups) <= 1:
         # Single head_dim — page sizes already uniform.
