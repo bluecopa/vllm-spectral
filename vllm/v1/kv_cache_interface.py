@@ -535,6 +535,26 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    num_blocks_per_group: list[int] | None = None
+    """
+    Optional number of KV cache blocks for each kv_cache_group. When set, each
+    group owns an independent block pool with block IDs local to that group.
+    When unset, all groups share the legacy global block pool.
+    """
+
+    def __post_init__(self) -> None:
+        if self.num_blocks_per_group is None:
+            return
+        assert len(self.num_blocks_per_group) == len(self.kv_cache_groups), (
+            "num_blocks_per_group must have one entry per KV cache group."
+        )
+        assert all(num_blocks > 0 for num_blocks in self.num_blocks_per_group), (
+            "Each KV cache group must have at least one block."
+        )
+
+    @property
+    def uses_grouped_block_pools(self) -> bool:
+        return self.num_blocks_per_group is not None
 
     @property
     def has_mamba_layers(self) -> bool:

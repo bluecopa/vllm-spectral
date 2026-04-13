@@ -29,6 +29,7 @@ from vllm.v1.core.kv_cache_utils import (
     generate_scheduler_kv_cache_config,
     get_kv_cache_configs,
     get_max_concurrency_for_kv_cache_config,
+    get_num_kv_cache_tokens,
     get_request_block_hasher,
     hash_block_tokens,
     init_none_hash,
@@ -1417,6 +1418,25 @@ def test_get_max_concurrency_for_kv_cache_config():
     )
     assert max_concurrency_hybrid_model == 3
 
+    kv_cache_config_grouped_hybrid_model = KVCacheConfig(
+        num_blocks=1024 * 3,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec([f"layer_{i}" for i in range(32)], full_attention_spec),
+            KVCacheGroupSpec(
+                [f"layer_{i}" for i in range(32, 64)], sliding_window_spec
+            ),
+        ],
+        num_blocks_per_group=[1024 * 3, 129 * 3],
+    )
+    max_concurrency_grouped_hybrid_model = get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config_grouped_hybrid_model
+    )
+    assert max_concurrency_grouped_hybrid_model == 3
+    assert get_num_kv_cache_tokens(
+        vllm_config, kv_cache_config_grouped_hybrid_model
+    ) == 129 * 3 * 16
+
 
 def test_allocate_with_lookahead():
     """Verify that lookahead tokens correctly affect block allocation"""
@@ -1473,6 +1493,59 @@ def test_allocate_with_lookahead():
         num_lookahead_tokens=4,
     )
     assert len(blocks.get_block_ids()[0]) == 2
+
+
+def test_grouped_block_pool_capacity_checks_are_per_group():
+    block_size = 4
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["full"],
+            new_kv_cache_spec(block_size=block_size, head_size=2),
+        ),
+        KVCacheGroupSpec(
+            ["sliding"],
+            new_sliding_window_spec(
+                block_size=block_size,
+                head_size=3,
+                sliding_window=16,
+            ),
+        ),
+    ]
+    request = make_request(
+        request_id="0",
+        prompt_token_ids=list(range(16)),
+        block_size=block_size,
+        hash_fn=sha256,
+    )
+
+    shared_pool_config = KVCacheConfig(
+        num_blocks=5,
+        kv_cache_tensors=[],
+        kv_cache_groups=kv_cache_groups,
+    )
+    shared_pool_manager = KVCacheManager(
+        kv_cache_config=shared_pool_config,
+        max_model_len=16,
+        hash_block_size=block_size,
+    )
+    assert not shared_pool_manager.can_fit_full_sequence(request)
+
+    grouped_pool_config = KVCacheConfig(
+        num_blocks=5,
+        kv_cache_tensors=[],
+        kv_cache_groups=kv_cache_groups,
+        num_blocks_per_group=[5, 5],
+    )
+    grouped_pool_manager = KVCacheManager(
+        kv_cache_config=grouped_pool_config,
+        max_model_len=16,
+        hash_block_size=block_size,
+    )
+    assert grouped_pool_manager.can_fit_full_sequence(request)
+
+    blocks = grouped_pool_manager.allocate_slots(request, num_new_tokens=16)
+    assert blocks is not None
+    assert blocks.get_block_ids() == ([1, 2, 3, 4], [1, 2, 3, 4])
 
 
 def test_get_kv_cache_config_one_worker():
@@ -1741,16 +1814,35 @@ def test_get_kv_cache_config_one_worker():
         ],
     )
 
-    # different hidden size that cannot be aligned by using different block size
+    # Different hidden size and different type that cannot be aligned by using
+    # different block sizes. Allocate per-layer tensors and use group-local
+    # block pools instead of rejecting the config.
+    full_spec = new_kv_cache_spec(head_size=64)
+    sliding_spec = new_sliding_window_spec(head_size=96)
     kv_cache_specs_hybrid = {
-        "layer_1": new_kv_cache_spec(head_size=64),
-        "layer_2": new_sliding_window_spec(head_size=96),
+        "layer_1": full_spec,
+        "layer_2": sliding_spec,
     }
 
-    with pytest.raises(NotImplementedError):
-        get_kv_cache_configs(
-            vllm_config, [kv_cache_specs_hybrid], [mem_per_block_per_layer * 2 * 32]
-        )[0]
+    kv_cache_config_hybrid = get_kv_cache_configs(
+        vllm_config,
+        [kv_cache_specs_hybrid],
+        [(full_spec.page_size_bytes + sliding_spec.page_size_bytes) * 32],
+    )[0]
+    assert kv_cache_config_hybrid == KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[
+            KVCacheTensor(size=full_spec.page_size_bytes * 32, shared_by=["layer_1"]),
+            KVCacheTensor(
+                size=sliding_spec.page_size_bytes * 32, shared_by=["layer_2"]
+            ),
+        ],
+        kv_cache_groups=[
+            KVCacheGroupSpec(["layer_1"], full_spec),
+            KVCacheGroupSpec(["layer_2"], sliding_spec),
+        ],
+        num_blocks_per_group=[32, 32],
+    )
 
     # Test num_gpu_blocks_override
     vllm_config.cache_config.num_gpu_blocks_override = 16

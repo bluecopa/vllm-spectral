@@ -805,6 +805,22 @@ def get_max_concurrency_for_kv_cache_config(
     """
     Get the maximum concurrency for the given KV cache configuration.
     """
+    if kv_cache_config.num_blocks_per_group is not None:
+        max_concurrency = float("inf")
+        for num_blocks, group in zip(
+            kv_cache_config.num_blocks_per_group, kv_cache_config.kv_cache_groups
+        ):
+            num_blocks_per_request = cdiv(
+                group.kv_cache_spec.max_memory_usage_bytes(vllm_config),
+                group.kv_cache_spec.page_size_bytes,
+            )
+            if num_blocks_per_request == 0:
+                continue
+            max_concurrency = min(
+                max_concurrency, num_blocks / num_blocks_per_request
+            )
+        return 0 if max_concurrency == float("inf") else max_concurrency
+
     num_layer_per_group = max(
         len(group.layer_names) for group in kv_cache_config.kv_cache_groups
     )
@@ -1103,6 +1119,8 @@ def get_kv_cache_config_from_groups(
             kv_cache_groups=kv_cache_groups,
         )
 
+    num_blocks_per_group = None
+
     # Determine how model runners should initialize the KV cache tensors.
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
@@ -1137,6 +1155,7 @@ def get_kv_cache_config_from_groups(
             num_blocks = int(available_memory // total_per_block)
             num_blocks = max(num_blocks, 0)
             num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+            num_blocks_per_group = [num_blocks] * len(kv_cache_groups)
             kv_cache_tensors = []
             for group in kv_cache_groups:
                 page_size = group.kv_cache_spec.page_size_bytes
@@ -1169,11 +1188,13 @@ def get_kv_cache_config_from_groups(
                 kv_cache_tensors.append(
                     KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
                 )
+            num_blocks_per_group = None
 
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        num_blocks_per_group=num_blocks_per_group,
     )
 
 
@@ -1291,6 +1312,10 @@ def generate_scheduler_kv_cache_config(
     assert all(
         [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
     )
+    assert all(
+        cfg.num_blocks_per_group == kv_cache_configs[0].num_blocks_per_group
+        for cfg in kv_cache_configs
+    )
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
@@ -1314,27 +1339,8 @@ def _report_kv_cache_config(
         vllm_config: The global VllmConfig
         kv_cache_config: The resolved KV cache configuration
     """
-    min_block_size = min(
-        [group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups]
-    )
-
     # Log the KV cache size and maximum concurrency.
-    num_tokens = (
-        kv_cache_config.num_blocks
-        // len(kv_cache_config.kv_cache_groups)
-        * min_block_size
-    )
-    dcp_size = vllm_config.parallel_config.decode_context_parallel_size
-    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
-    if pcp_size * dcp_size > 1:
-        num_tokens *= pcp_size * dcp_size
-        logger.info(
-            "Multiplying the GPU KV cache size by the cp_world_size %d "
-            "(pcp_world_size %d * dcp_world_size %d).",
-            pcp_size * dcp_size,
-            pcp_size,
-            dcp_size,
-        )
+    num_tokens = get_num_kv_cache_tokens(vllm_config, kv_cache_config)
     num_tokens_str = f"{num_tokens:,}"
     logger.info_once("GPU KV cache size: %s tokens", num_tokens_str, scope="local")
     max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
@@ -1347,6 +1353,45 @@ def _report_kv_cache_config(
         max_concurrency,
         scope="local",
     )
+
+
+def get_num_kv_cache_tokens(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> int:
+    """
+    Return the effective token capacity exposed by the KV cache block tables.
+    """
+    if not kv_cache_config.kv_cache_groups:
+        return 0
+    if kv_cache_config.num_blocks_per_group is not None:
+        num_tokens = min(
+            num_blocks * group.kv_cache_spec.block_size
+            for num_blocks, group in zip(
+                kv_cache_config.num_blocks_per_group, kv_cache_config.kv_cache_groups
+            )
+        )
+    else:
+        min_block_size = min(
+            group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
+        )
+        num_tokens = (
+            kv_cache_config.num_blocks
+            // len(kv_cache_config.kv_cache_groups)
+            * min_block_size
+        )
+
+    dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+    pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
+    if pcp_size * dcp_size > 1:
+        num_tokens *= pcp_size * dcp_size
+        logger.info(
+            "Multiplying the GPU KV cache size by the cp_world_size %d "
+            "(pcp_world_size %d * dcp_world_size %d).",
+            pcp_size * dcp_size,
+            pcp_size,
+            dcp_size,
+        )
+    return num_tokens
 
 
 def _max_memory_usage_bytes_from_groups(
@@ -1639,6 +1684,10 @@ def get_kv_cache_configs(
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks
         kv_cache_config.num_blocks = min_num_blocks
+        if kv_cache_config.num_blocks_per_group is not None:
+            kv_cache_config.num_blocks_per_group = [
+                min_num_blocks
+            ] * len(kv_cache_config.num_blocks_per_group)
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:

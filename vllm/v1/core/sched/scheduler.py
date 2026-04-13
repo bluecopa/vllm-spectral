@@ -38,6 +38,7 @@ from vllm.v1.core.encoder_cache_manager import (
 )
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
+from vllm.v1.core.kv_cache_utils import get_num_kv_cache_tokens
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -239,6 +240,11 @@ class Scheduler(SchedulerInterface):
         if self.connector is not None and hasattr(
             self.connector, "bind_gpu_block_pool"
         ):
+            if self.kv_cache_manager.kv_cache_config.uses_grouped_block_pools:
+                raise NotImplementedError(
+                    "KV connectors do not yet support group-local KV cache "
+                    "block pools."
+                )
             self.connector.bind_gpu_block_pool(self.kv_cache_manager.block_pool)
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
@@ -273,20 +279,9 @@ class Scheduler(SchedulerInterface):
                 if isinstance(group.kv_cache_spec, AttentionSpec):
                     self.routed_experts_attn_gid = gid
                     break
-            min_block_size = min(
-                [
-                    group.kv_cache_spec.block_size
-                    for group in kv_cache_config.kv_cache_groups
-                ]
+            self.max_num_kv_tokens = get_num_kv_cache_tokens(
+                self.vllm_config, kv_cache_config
             )
-            num_groups = len(kv_cache_config.kv_cache_groups)
-            self.max_num_kv_tokens = (
-                kv_cache_config.num_blocks // num_groups
-            ) * min_block_size
-            dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
-            pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
-            if pcp_size * dcp_size > 1:
-                self.max_num_kv_tokens *= pcp_size * dcp_size
 
             self.routed_experts_reader.attach_buffer(
                 max_num_kv_tokens=self.max_num_kv_tokens,

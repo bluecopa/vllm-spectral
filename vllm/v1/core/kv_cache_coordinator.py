@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from math import lcm
 
+from vllm.distributed.kv_events import KVCacheEvent
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -23,6 +24,30 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
 )
 from vllm.v1.request import Request
+
+
+class _GroupedBlockPoolLookup:
+    """Prefix-cache lookup facade for group-local block pools."""
+
+    def __init__(self, block_pools: Sequence[BlockPool]) -> None:
+        self.block_pools = block_pools
+        self.null_block = block_pools[0].null_block
+
+    def get_cached_block(
+        self, block_hash: BlockHash, kv_cache_group_ids: list[int]
+    ) -> list[KVCacheBlock] | None:
+        cached_blocks = []
+        for group_id in kv_cache_group_ids:
+            cached_block = self.block_pools[group_id].get_cached_block(
+                block_hash, [group_id]
+            )
+            if cached_block is None:
+                return None
+            cached_blocks.append(cached_block[0])
+        return cached_blocks
+
+    def get_null_block(self, kv_cache_group_id: int) -> KVCacheBlock:
+        return self.block_pools[kv_cache_group_id].null_block
 
 
 class KVCacheCoordinator(ABC):
@@ -45,21 +70,46 @@ class KVCacheCoordinator(ABC):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
+        self.uses_grouped_block_pools = kv_cache_config.uses_grouped_block_pools
 
-        self.block_pool = BlockPool(
-            kv_cache_config.num_blocks,
-            enable_caching,
-            hash_block_size,
-            enable_kv_cache_events,
-            metrics_collector,
-        )
+        if self.uses_grouped_block_pools:
+            assert kv_cache_config.num_blocks_per_group is not None
+            metrics_offset = 0
+            block_pools = []
+            for num_blocks in kv_cache_config.num_blocks_per_group:
+                block_pools.append(
+                    BlockPool(
+                        num_blocks,
+                        enable_caching,
+                        hash_block_size,
+                        enable_kv_cache_events,
+                        metrics_collector,
+                        metrics_key_offset=metrics_offset,
+                    )
+                )
+                metrics_offset += num_blocks
+            self.block_pools = tuple(block_pools)
+            self.block_pool = self.block_pools[0]
+            self.prefix_cache_block_pool = _GroupedBlockPoolLookup(self.block_pools)
+        else:
+            self.block_pool = BlockPool(
+                kv_cache_config.num_blocks,
+                enable_caching,
+                hash_block_size,
+                enable_kv_cache_events,
+                metrics_collector,
+            )
+            self.block_pools = tuple(
+                self.block_pool for _ in self.kv_cache_config.kv_cache_groups
+            )
+            self.prefix_cache_block_pool = self.block_pool
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
-                block_pool=self.block_pool,
+                block_pool=self.block_pools[i],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,
@@ -96,23 +146,111 @@ class KVCacheCoordinator(ABC):
         Returns:
             The number of blocks to allocate.
         """
-        num_blocks_to_allocate = 0
+        return sum(
+            self.get_num_blocks_to_allocate_by_group(
+                request_id=request_id,
+                num_tokens=num_tokens,
+                new_computed_blocks=new_computed_blocks,
+                num_encoder_tokens=num_encoder_tokens,
+                total_computed_tokens=total_computed_tokens,
+                num_tokens_main_model=num_tokens_main_model,
+            )
+        )
+
+    def get_num_blocks_to_allocate_by_group(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+    ) -> list[int]:
+        """
+        Get the number of blocks needed to be allocated for each KV cache group.
+        """
+        num_blocks_to_allocate = []
         for i, manager in enumerate(self.single_type_managers):
             if isinstance(manager, CrossAttentionManager):
                 # For cross-attention, we issue a single static allocation
                 # of blocks based on the number of encoder input tokens.
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                num_blocks = manager.get_num_blocks_to_allocate(
                     request_id, num_encoder_tokens, [], 0, num_encoder_tokens
                 )
             else:
-                num_blocks_to_allocate += manager.get_num_blocks_to_allocate(
+                num_blocks = manager.get_num_blocks_to_allocate(
                     request_id,
                     num_tokens,
                     new_computed_blocks[i],
                     total_computed_tokens,
                     num_tokens_main_model,
                 )
+            num_blocks_to_allocate.append(num_blocks)
         return num_blocks_to_allocate
+
+    def can_allocate(
+        self,
+        request_id: str,
+        num_tokens: int,
+        new_computed_blocks: tuple[Sequence[KVCacheBlock], ...],
+        num_encoder_tokens: int,
+        total_computed_tokens: int,
+        num_tokens_main_model: int,
+    ) -> bool:
+        """
+        Return whether each backing block pool has enough free blocks.
+        """
+        num_blocks_to_allocate = self.get_num_blocks_to_allocate_by_group(
+            request_id=request_id,
+            num_tokens=num_tokens,
+            new_computed_blocks=new_computed_blocks,
+            num_encoder_tokens=num_encoder_tokens,
+            total_computed_tokens=total_computed_tokens,
+            num_tokens_main_model=num_tokens_main_model,
+        )
+        if self.uses_grouped_block_pools:
+            return all(
+                num_blocks <= block_pool.get_num_free_blocks()
+                for num_blocks, block_pool in zip(
+                    num_blocks_to_allocate, self.block_pools
+                )
+            )
+        return sum(num_blocks_to_allocate) <= self.block_pool.get_num_free_blocks()
+
+    def get_usage(self) -> float:
+        if self.uses_grouped_block_pools:
+            return max(block_pool.get_usage() for block_pool in self.block_pools)
+        return self.block_pool.get_usage()
+
+    def evict_blocks(self, block_ids: set[int]) -> None:
+        if self.uses_grouped_block_pools:
+            for block_pool in self.block_pools:
+                valid_block_ids = {
+                    block_id
+                    for block_id in block_ids
+                    if block_id < len(block_pool.blocks)
+                }
+                block_pool.evict_blocks(valid_block_ids)
+            return
+        self.block_pool.evict_blocks(block_ids)
+
+    def reset_prefix_cache(self) -> bool:
+        reset_successful = True
+        block_pools = self.block_pools if self.uses_grouped_block_pools else (
+            self.block_pool,
+        )
+        for block_pool in block_pools:
+            reset_successful = block_pool.reset_prefix_cache() and reset_successful
+        return reset_successful
+
+    def take_events(self) -> list[KVCacheEvent]:
+        events: list[KVCacheEvent] = []
+        block_pools = self.block_pools if self.uses_grouped_block_pools else (
+            self.block_pool,
+        )
+        for block_pool in block_pools:
+            events.extend(block_pool.take_events())
+        return events
 
     def allocate_new_computed_blocks(
         self,
@@ -355,7 +493,7 @@ class UnitaryKVCacheCoordinator(KVCacheCoordinator):
             block_hashes=block_hashes,
             max_length=max_cache_hit_length,
             kv_cache_group_ids=[0],
-            block_pool=self.block_pool,
+            block_pool=self.prefix_cache_block_pool,
             kv_cache_spec=self.kv_cache_spec,
             use_eagle=self.use_eagle,
             alignment_tokens=self.block_size,
@@ -515,7 +653,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         block_hashes=_get_block_hashes(spec),
                         max_length=curr_hit_length,
                         kv_cache_group_ids=group_ids,
-                        block_pool=self.block_pool,
+                        block_pool=self.prefix_cache_block_pool,
                         kv_cache_spec=spec,
                         use_eagle=self.use_eagle,
                         alignment_tokens=self.lcm_block_size,

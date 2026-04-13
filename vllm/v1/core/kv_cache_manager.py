@@ -159,7 +159,7 @@ class KVCacheManager:
         Returns:
             The KV cache usage (between 0.0 and 1.0).
         """
-        return self.block_pool.get_usage()
+        return self.coordinator.get_usage()
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -243,7 +243,7 @@ class KVCacheManager:
         )
         full_num_tokens = min(request.num_tokens, self.max_model_len)
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        return self.coordinator.can_allocate(
             request_id=request.request_id,
             num_tokens=full_num_tokens,
             new_computed_blocks=new_computed_block_list,
@@ -251,8 +251,6 @@ class KVCacheManager:
             total_computed_tokens=total_computed_tokens,
             num_tokens_main_model=full_num_tokens,
         )
-
-        return num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
 
     def allocate_slots(
         self,
@@ -374,7 +372,7 @@ class KVCacheManager:
             request.request_id, total_computed_tokens
         )
 
-        num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+        can_allocate = self.coordinator.can_allocate(
             request_id=request.request_id,
             num_tokens=num_tokens_need_slot,
             new_computed_blocks=new_computed_block_list,
@@ -384,7 +382,7 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+        if not can_allocate:
             # Cannot allocate new blocks
             return None
 
@@ -455,7 +453,7 @@ class KVCacheManager:
         Args:
             block_ids: Set of block IDs to evict from cache.
         """
-        self.block_pool.evict_blocks(block_ids)
+        self.coordinator.evict_blocks(block_ids)
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -466,7 +464,7 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        if not self.block_pool.reset_prefix_cache():
+        if not self.coordinator.reset_prefix_cache():
             return False
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -513,7 +511,7 @@ class KVCacheManager:
         Returns:
             A list of KV cache events.
         """
-        return self.block_pool.take_events()
+        return self.coordinator.take_events()
 
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""

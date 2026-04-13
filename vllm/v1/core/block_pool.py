@@ -152,11 +152,13 @@ class BlockPool:
         hash_block_size: int,
         enable_kv_cache_events: bool = False,
         metrics_collector: KVCacheMetricsCollector | None = None,
+        metrics_key_offset: int = 0,
     ):
         assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
         self.num_gpu_blocks = num_gpu_blocks
         self.enable_caching = enable_caching
         self.hash_block_size = hash_block_size
+        self.metrics_key_offset = metrics_key_offset
         # All kv-cache blocks.
         self.blocks: list[KVCacheBlock] = [
             KVCacheBlock(idx) for idx in range(num_gpu_blocks)
@@ -340,13 +342,17 @@ class BlockPool:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
+                    self.metrics_collector.on_block_allocated(
+                        block, self.metrics_key_offset + block.block_id
+                    )
         else:
             for block in ret:
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
-                    self.metrics_collector.on_block_allocated(block)
+                    self.metrics_collector.on_block_allocated(
+                        block, self.metrics_key_offset + block.block_id
+                    )
         return ret
 
     def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
@@ -362,7 +368,9 @@ class BlockPool:
         """
         # Clean up metrics tracking first to prevent leaks
         if self.metrics_collector:
-            self.metrics_collector.on_block_evicted(block)
+            self.metrics_collector.on_block_evicted(
+                block, self.metrics_key_offset + block.block_id
+            )
 
         block_hash = block.block_hash
         if block_hash is None:
@@ -404,7 +412,9 @@ class BlockPool:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
             if self.metrics_collector:
-                self.metrics_collector.on_block_accessed(block)
+                self.metrics_collector.on_block_accessed(
+                    block, self.metrics_key_offset + block.block_id
+                )
 
     def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
         """Free a list of blocks. The blocks should be ordered by their
